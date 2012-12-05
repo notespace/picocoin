@@ -36,9 +36,17 @@ Similarly, you may read multiple configuration files into the settings map:
 Recognized parameters
 =====================
 
+addnode
+------------------
+Format: address SPACE port
+
+Manually add P2P node to peer manager.
+
+
 config (alias "c")
 ------------------
 Specify a pathname to the configuration file.
+
 
 wallet (alias "w")
 ------------------
@@ -46,6 +54,11 @@ Specify a pathname to the wallet data file.  Default "picocoin.wallet"
 
 AES encryption is applied to the wallet.  Passphrase is specified via
 environment variable PICOCOIN_PASSPHRASE.
+
+
+debug
+------------------
+Enable additional debug output.
 
 
 
@@ -61,6 +74,10 @@ internal parameters (pchMessageStart / network magic, genesis block, ...)
 dns-seeds
 ---------
 Query and display bitcoin DNS seeds, for P2P node addresses.
+
+help
+----
+Output these commands and recognized settings.
 
 list-settings
 -------------

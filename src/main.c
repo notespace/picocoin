@@ -35,11 +35,13 @@ struct wallet *cur_wallet;
 const struct chain_info *chain = NULL;
 bu256_t chain_genesis;
 uint64_t instance_nonce;
+bool debugging = false;
 
 static const char *const_settings[] = {
 	"wallet=picocoin.wallet",
 	"chain=bitcoin",
 	"peers=picocoin.peers",
+	"blkdb=picocoin.blkdb",
 };
 
 
@@ -111,11 +113,14 @@ static bool do_setting(const char *arg)
 	 * trigger special setting-specific behaviors
 	 */
 
-	if (!strcmp(key, "config") || !strcmp(key, "c"))
+	if (!strcmp(key, "debug"))
+		debugging = true;
+
+	else if (!strcmp(key, "config") || !strcmp(key, "c"))
 		return read_config_file(value);
 
 	/* clear previous wallet, if new wallet file seen */
-	if (!strcmp(key, "wallet") || !strcmp(key, "w"))
+	else if (!strcmp(key, "wallet") || !strcmp(key, "w"))
 		cur_wallet_free();
 
 	return true;
@@ -175,29 +180,9 @@ static void list_dns_seeds(void)
 	for (tmp = addrlist; tmp != NULL; tmp = tmp->next) {
 		struct bp_address *addr = tmp->data;
 		char host[64];
+
 		bool is_ipv4 = is_ipv4_mapped(addr->ip);
-
-		if (is_ipv4) {
-			struct sockaddr_in saddr;
-
-			memset(&saddr, 0, sizeof(saddr));
-			saddr.sin_family = AF_INET;
-			memcpy(&saddr.sin_addr, &addr->ip[12], 4);
-
-			getnameinfo((struct sockaddr *) &saddr, sizeof(saddr),
-				    host, sizeof(host),
-				    NULL, 0, NI_NUMERICHOST);
-		} else {
-			struct sockaddr_in6 saddr;
-
-			memset(&saddr, 0, sizeof(saddr));
-			saddr.sin6_family = AF_INET6;
-			memcpy(&saddr.sin6_addr, &addr->ip, 16);
-
-			getnameinfo((struct sockaddr *) &saddr, sizeof(saddr),
-				    host, sizeof(host),
-				    NULL, 0, NI_NUMERICHOST);
-		}
+		address_str(host, sizeof(host), addr);
 
 		printf("  [ %s, \"%s\", %u, %llu ]%s\n",
 		       is_ipv4 ? "true" : "false",
@@ -234,10 +219,43 @@ static void chain_set(void)
 	bu256_copy(&chain_genesis, &new_genesis);
 }
 
+static void print_help()
+{
+	const char *settings[] = {
+		"config","Pathname to the configuration file.",
+		"wallet","Pathname to the wallet file.",
+		"chain","One of 'bitcoin' or 'testnet3', use with chain-set command.",
+		"debug","Enable debugging output",
+	};
+
+	const char *commands[] = {
+		"chain-set","Select blockchain and network.",
+		"dns-seeds","Query and display bitcoin DNS seeds.",
+		"list-settings","Display settings map.",
+		"new-address","Generate a new address and output it. Store pair in wallet.",
+		"new-wallet","Initialize a new wallet. Refuses to initialize if the file exists.",
+		"netsync","\tSynchronize with the network, sending and receiving payments.",
+		"wallet-addr","List all address in the wallet.",
+		"wallet-dump","Dump entire wallet contents, including private keys.",
+		"wallet-info","Print informational summary of wallet data."
+	};
+
+	fprintf(stderr, "usage: %s <command|setting> [<command|setting>...]",
+			prog_name);
+	fprintf(stderr, "\n\nsettings, list in the form key=value:\n\n");
+	unsigned int i;
+	for (i = 0; i < ARRAY_SIZE(settings); i += 2)
+		fprintf(stderr, "\t%s\t%s\n", settings[i], settings[i+1]);
+	fprintf(stderr, "\ncommands:\n\n");
+	for (i = 0; i < ARRAY_SIZE(commands); i += 2)
+		fprintf(stderr, "\t%s\t%s\n", commands[i], commands[i+1]);
+}
+
 static bool is_command(const char *s)
 {
 	return	!strcmp(s, "chain-set") ||
 		!strcmp(s, "dns-seeds") ||
+		!strcmp(s, "help") ||
 		!strcmp(s, "list-settings") ||
 		!strcmp(s, "new-address") ||
 		!strcmp(s, "new-wallet") ||
@@ -256,6 +274,9 @@ static bool do_command(const char *s)
 
 	else if (!strcmp(s, "dns-seeds"))
 		list_dns_seeds();
+
+	else if (!strcmp(s, "help"))
+		print_help();
 
 	else if (!strcmp(s, "list-settings"))
 		list_settings();

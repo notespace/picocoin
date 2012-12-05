@@ -17,14 +17,17 @@ libccoin_a_SOURCES=	\
 	coredefs.c	\
 	dns.c		\
 	hexcode.c	\
+	file_seq.c	\
 	key.c		\
 	keyset.c	\
+	keystore.c	\
 	mbr.c		\
 	memmem.c	\
 	message.c	\
 	script.c	\
 	script_eval.c	\
 	script_names.c	\
+	script_sign.c	\
 	serialize.c	\
 	util.c		\
 	utxo.c

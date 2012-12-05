@@ -10,8 +10,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #ifdef WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include <mingw.h>
+#include "fakepoll.h"
 #else
 #include <sys/wait.h>
 #include <sys/uio.h>
@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <assert.h>
 #include <signal.h>
 #include <errno.h>
 #include <glib.h>
@@ -63,8 +64,13 @@ struct net_child_info {
 };
 
 struct nc_conn {
+	bool			dead;
+
 	int			fd;
-	struct bp_address	addr;
+
+	struct peer		peer;
+	char			addr_str[64];
+
 	bool			ipv4;
 	bool			connected;
 	struct event		*ev;
@@ -91,11 +97,42 @@ enum {
 	NC_MAX_CONN		= 8,
 };
 
-static void nc_conn_free(struct nc_conn *conn);
+static bool network_child_running;
+static void nc_conn_kill(struct nc_conn *conn);
 static bool nc_conn_read_enable(struct nc_conn *conn);
 static bool nc_conn_read_disable(struct nc_conn *conn);
 static bool nc_conn_write_enable(struct nc_conn *conn);
 static bool nc_conn_write_disable(struct nc_conn *conn);
+
+void address_str(char *host, size_t hostsz,
+		 const struct bp_address *addr)
+{
+	bool is_ipv4 = is_ipv4_mapped(addr->ip);
+
+	if (is_ipv4) {
+		struct sockaddr_in saddr;
+
+		memset(&saddr, 0, sizeof(saddr));
+		saddr.sin_family = AF_INET;
+		memcpy(&saddr.sin_addr, &addr->ip[12], 4);
+
+		getnameinfo((struct sockaddr *) &saddr, sizeof(saddr),
+			    host, hostsz,
+			    NULL, 0, NI_NUMERICHOST);
+	} else {
+		struct sockaddr_in6 saddr;
+
+		memset(&saddr, 0, sizeof(saddr));
+		saddr.sin6_family = AF_INET6;
+		memcpy(&saddr.sin6_addr, &addr->ip, 16);
+
+		getnameinfo((struct sockaddr *) &saddr, sizeof(saddr),
+			    host, hostsz,
+			    NULL, 0, NI_NUMERICHOST);
+	}
+
+	host[hostsz - 1] = 0;
+}
 
 static void pipwr(int fd, const void *buf, size_t len)
 {
@@ -218,7 +255,7 @@ static void nc_conn_write_evt(int fd, short events, void *priv)
 
 	if (wrc < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK)
-			nc_conn_free(conn);
+			goto err_out;
 		return;
 	}
 
@@ -230,6 +267,11 @@ static void nc_conn_write_evt(int fd, short events, void *priv)
 		nc_conn_write_disable(conn);
 		nc_conn_read_enable(conn);
 	}
+
+	return;
+
+err_out:
+	nc_conn_kill(conn);
 }
 
 static bool nc_conn_send(struct nc_conn *conn, const char *command,
@@ -255,6 +297,7 @@ static bool nc_conn_send(struct nc_conn *conn, const char *command,
 
 	/* attempt optimistic write */
 	ssize_t wrc = write(conn->fd, buf->p, buf->len);
+
 	if (wrc < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK) {
 			free(buf->p);
@@ -298,6 +341,21 @@ static bool nc_msg_version(struct nc_conn *conn)
 	if (!deser_msg_version(&mv, &buf))
 		goto out;
 
+	if (debugging) {
+		char fromstr[64], tostr[64];
+		address_str(fromstr, sizeof(fromstr), &mv.addrFrom);
+		address_str(tostr, sizeof(tostr), &mv.addrTo);
+		fprintf(stderr, "net: %s version(%u, 0x%llx, %lld, To:%s, From:%s, %s, %u)\n",
+			conn->addr_str,
+			mv.nVersion,
+			(unsigned long long) mv.nServices,
+			(long long) mv.nTime,
+			tostr,
+			fromstr,
+			mv.strSubVer,
+			mv.nStartingHeight);
+	}
+
 	if (!(mv.nServices & NODE_NETWORK))	/* require NODE_NETWORK */
 		goto out;
 	if (mv.nonce == instance_nonce)		/* connected to ourselves? */
@@ -327,6 +385,10 @@ static bool nc_msg_addr(struct nc_conn *conn)
 	if (!deser_msg_addr(conn->protover, &ma, &buf))
 		goto out;
 
+	if (debugging)
+		fprintf(stderr, "net: %s addr(%u addresses)\n",
+			conn->addr_str, ma.addrs->len);
+
 	/* ignore ancient addresses */
 	if (conn->protover < CADDR_TIME_VERSION)
 		goto out_ok;
@@ -335,7 +397,7 @@ static bool nc_msg_addr(struct nc_conn *conn)
 	unsigned int i;
 	for (i = 0; i < ma.addrs->len; i++) {
 		struct bp_address *addr = g_ptr_array_index(ma.addrs, i);
-		peerman_add(conn->nci->peers, addr, false);
+		peerman_add_addr(conn->nci->peers, addr, false);
 	}
 
 out_ok:
@@ -358,7 +420,7 @@ static bool nc_msg_verack(struct nc_conn *conn)
 	 * the peer is re-added.  Thus, peers are immediately
 	 * forgotten if they fail, on the first try.
 	 */
-	peerman_add(conn->nci->peers, &conn->addr, true);
+	peerman_add(conn->nci->peers, &conn->peer, true);
 
 	/* request peer addresses */
 	if ((conn->protover >= CADDR_TIME_VERSION) &&
@@ -370,27 +432,41 @@ static bool nc_msg_verack(struct nc_conn *conn)
 
 static bool nc_conn_message(struct nc_conn *conn)
 {
-	/* verify correct network */
-	if (memcmp(conn->msg.hdr.netmagic, chain->netmagic, 4))
-		return false;
-
 	char *command = conn->msg.hdr.command;
+
+	if (debugging)
+		fprintf(stderr, "net: %s message %s\n",
+			conn->addr_str,
+			command);
+
+	/* verify correct network */
+	if (memcmp(conn->msg.hdr.netmagic, chain->netmagic, 4)) {
+		fprintf(stderr, "net: %s invalid network\n",
+			conn->addr_str);
+		return false;
+	}
 
 	/* incoming message: version */
 	if (!strncmp(command, "version", 12))
 		return nc_msg_version(conn);
 
 	/* "version" must be first message */
-	if (!conn->seen_version)
+	if (!conn->seen_version) {
+		fprintf(stderr, "net: %s 'version' not first\n",
+			conn->addr_str);
 		return false;
+	}
 
 	/* incoming message: verack */
 	if (!strncmp(command, "verack", 12))
 		return nc_msg_verack(conn);
 
 	/* "verack" must be second message */
-	if (!conn->seen_verack)
+	if (!conn->seen_verack) {
+		fprintf(stderr, "net: %s 'verack' not second\n",
+			conn->addr_str);
 		return false;
+	}
 
 	/* incoming message: addr */
 	if (!strncmp(command, "addr", 12))
@@ -408,14 +484,14 @@ static bool nc_conn_ip_active(struct net_child_info *nci,
 		struct nc_conn *conn;
 
 		conn = g_ptr_array_index(nci->conns, i);
-		if (!memcmp(conn->addr.ip, ip, 16))
+		if (!memcmp(conn->peer.addr.ip, ip, 16))
 			return true;
 	}
 
 	return false;
 }
 
-static struct nc_conn *nc_conn_new(const struct bp_address *addr_in)
+static struct nc_conn *nc_conn_new(const struct peer *peer)
 {
 	struct nc_conn *conn;
 
@@ -425,10 +501,18 @@ static struct nc_conn *nc_conn_new(const struct bp_address *addr_in)
 
 	conn->fd = -1;
 
-	if (addr_in)
-		memcpy(&conn->addr, addr_in, sizeof(*addr_in));
+	peer_copy(&conn->peer, peer);
+	address_str(conn->addr_str, sizeof(conn->addr_str), &conn->peer.addr);
 
 	return conn;
+}
+
+static void nc_conn_kill(struct nc_conn *conn)
+{
+	assert(conn->dead == false);
+
+	conn->dead = true;
+	event_base_loopbreak(conn->nci->eb);
 }
 
 static void nc_conn_free(struct nc_conn *conn)
@@ -466,23 +550,32 @@ static void nc_conn_free(struct nc_conn *conn)
 
 	free(conn->msg.data);
 
+	memset(conn, 0, sizeof(*conn));
 	free(conn);
 }
 
 static bool nc_conn_start(struct nc_conn *conn)
 {
+	char errpfx[64];
+
 	/* create socket */
-	conn->ipv4 = is_ipv4_mapped(conn->addr.ip);
+	conn->ipv4 = is_ipv4_mapped(conn->peer.addr.ip);
 	conn->fd = socket(conn->ipv4 ? AF_INET : AF_INET6,
 			  SOCK_STREAM, IPPROTO_TCP);
-	if (conn->fd < 0)
+	if (conn->fd < 0) {
+		sprintf(errpfx, "socket %s", conn->addr_str);
+		perror(errpfx);
 		return false;
+	}
 
 	/* set non-blocking */
 	int flags = fcntl(conn->fd, F_GETFL, 0);
 	if ((flags < 0) ||
-	    (fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK) < 0))
+	    (fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK) < 0)) {
+		sprintf(errpfx, "socket fcntl %s", conn->addr_str);
+		perror(errpfx);
 		return false;
+	}
 
 	struct sockaddr *saddr;
 	struct sockaddr_in6 saddr6;
@@ -494,8 +587,8 @@ static bool nc_conn_start(struct nc_conn *conn)
 		memset(&saddr4, 0, sizeof(saddr4));
 		saddr4.sin_family = AF_INET;
 		memcpy(&saddr4.sin_addr.s_addr,
-		       &conn->addr.ip[12], 4);
-		saddr4.sin_port = htons(conn->addr.port);
+		       &conn->peer.addr.ip[12], 4);
+		saddr4.sin_port = htons(conn->peer.addr.port);
 
 		saddr = (struct sockaddr *) &saddr4;
 		saddr_len = sizeof(saddr4);
@@ -503,27 +596,36 @@ static bool nc_conn_start(struct nc_conn *conn)
 		memset(&saddr6, 0, sizeof(saddr6));
 		saddr6.sin6_family = AF_INET6;
 		memcpy(&saddr6.sin6_addr.s6_addr,
-		       &conn->addr.ip[0], 16);
-		saddr6.sin6_port = htons(conn->addr.port);
+		       &conn->peer.addr.ip[0], 16);
+		saddr6.sin6_port = htons(conn->peer.addr.port);
 
 		saddr = (struct sockaddr *) &saddr6;
 		saddr_len = sizeof(saddr6);
 	}
 
 	/* initiate TCP connection */
-	if (connect(conn->fd, saddr, saddr_len) < 0)
-		return false;
+	if (connect(conn->fd, saddr, saddr_len) < 0) {
+		if (errno != EINPROGRESS) {
+			sprintf(errpfx, "socket connect %s", conn->addr_str);
+			perror(errpfx);
+			return false;
+		}
+	}
 
 	return true;
 }
 
-static void nc_conn_got_header(struct nc_conn *conn)
+static bool nc_conn_got_header(struct nc_conn *conn)
 {
 	parse_message_hdr(&conn->msg.hdr, conn->hdrbuf);
 
 	unsigned int data_len = conn->msg.hdr.data_len;
-	if (data_len > (16 * 1024 * 1024))
-		goto err_out;
+
+	if (data_len > (16 * 1024 * 1024)) {
+		free(conn->msg.data);
+		conn->msg.data = NULL;
+		return false;
+	}
 
 	conn->msg.data = malloc(data_len);
 
@@ -532,19 +634,19 @@ static void nc_conn_got_header(struct nc_conn *conn)
 	conn->expected = data_len;
 	conn->reading_hdr = false;
 
-	return;
-
-err_out:
-	nc_conn_free(conn);
+	return true;
 }
 
-static void nc_conn_got_msg(struct nc_conn *conn)
+static bool nc_conn_got_msg(struct nc_conn *conn)
 {
-	if (!message_valid(&conn->msg))
-		goto err_out;
+	if (!message_valid(&conn->msg)) {
+		fprintf(stderr, "llnet: %s invalid message\n",
+			conn->addr_str);
+		return false;
+	}
 
 	if (!nc_conn_message(conn))
-		goto err_out;
+		return false;
 
 	free(conn->msg.data);
 	conn->msg.data = NULL;
@@ -554,10 +656,7 @@ static void nc_conn_got_msg(struct nc_conn *conn)
 	conn->expected = P2P_HDR_SZ;
 	conn->reading_hdr = true;
 
-	return;
-
-err_out:
-	nc_conn_free(conn);
+	return true;
 }
 
 static void nc_conn_read_evt(int fd, short events, void *priv)
@@ -566,19 +665,37 @@ static void nc_conn_read_evt(int fd, short events, void *priv)
 
 	ssize_t rrc = read(fd, conn->msg_p, conn->expected);
 	if (rrc <= 0) {
-		nc_conn_free(conn);
-		return;
+		if (rrc < 0)
+			fprintf(stderr, "llnet: %s read: %s\n",
+				conn->addr_str,
+				strerror(errno));
+		else
+			fprintf(stderr, "llnet: %s read EOF\n", conn->addr_str);
+
+		goto err_out;
 	}
 
 	conn->msg_p += rrc;
 	conn->expected -= rrc;
 
-	if (conn->expected == 0) {
-		if (conn->reading_hdr)
-			nc_conn_got_header(conn);
-		else
-			nc_conn_got_msg(conn);
+	/* execute our state machine at most twice */
+	unsigned int i;
+	for (i = 0; i < 2; i++) {
+		if (conn->expected == 0) {
+			if (conn->reading_hdr) {
+				if (!nc_conn_got_header(conn))
+					goto err_out;
+			} else {
+				if (!nc_conn_got_msg(conn))
+					goto err_out;
+			}
+		}
 	}
+
+	return;
+
+err_out:
+	nc_conn_kill(conn);
 }
 
 static GString *nc_version_build(struct nc_conn *conn)
@@ -669,78 +786,140 @@ static void nc_conn_evt_connected(int fd, short events, void *priv)
 {
 	struct nc_conn *conn = priv;
 
+	if ((events & EV_WRITE) == 0) {
+		fprintf(stderr, "net: %s connection timeout\n", conn->addr_str);
+		goto err_out;
+	}
+
 	int err = 0;
 	socklen_t len = sizeof(err);
 
 	/* check success of connect(2) */
 	if ((getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) ||
-	    (err != 0))
+	    (err != 0)) {
+		fprintf(stderr, "net: connect %s failed: %s\n",
+			conn->addr_str, strerror(err));
 		goto err_out;
+	}
+
+	if (debugging)
+		fprintf(stderr, "net: connected to %s\n", conn->addr_str);
 
 	conn->connected = true;
 
+	/* clear event used for watching connect(2) */
 	event_free(conn->ev);
 	conn->ev = NULL;
 
 	/* build and send "version" message */
 	GString *msg_data = nc_version_build(conn);
-	GString *msg = message_str(chain->netmagic, "version",
-				   msg_data->str, msg_data->len);
+	bool rc = nc_conn_send(conn, "version", msg_data->str, msg_data->len);
 	g_string_free(msg_data, TRUE);
 
-	unsigned int msg_len = msg->len;
-	ssize_t wrc = write(conn->fd, msg->str, msg_len);
-
-	g_string_free(msg, TRUE);
-
-	if (wrc != msg_len)
+	if (!rc) {
+		fprintf(stderr, "net: %s !conn_send\n", conn->addr_str);
 		goto err_out;
+	}
 
 	/* switch to read-header state */
 	conn->msg_p = conn->hdrbuf;
 	conn->expected = P2P_HDR_SZ;
 	conn->reading_hdr = true;
 
-	if (!nc_conn_read_enable(conn))
+	if (!nc_conn_read_enable(conn)) {
+		fprintf(stderr, "net: %s read not enabled\n", conn->addr_str);
 		goto err_out;
+	}
 
 	return;
 
 err_out:
-	nc_conn_free(conn);
+	nc_conn_kill(conn);
+}
+
+static void nc_conns_gc(struct net_child_info *nci)
+{
+	GList *dead = NULL;
+	unsigned int n_gc = 0;
+
+	/* build list of dead connections */
+	unsigned int i;
+	for (i = 0; i < nci->conns->len; i++) {
+		struct nc_conn *conn = g_ptr_array_index(nci->conns, i);
+		if (conn->dead)
+			dead = g_list_prepend(dead, conn);
+	}
+
+	/* remove and free dead connections */
+	GList *tmp = dead;
+	while (tmp) {
+		struct nc_conn *conn = tmp->data;
+		tmp = tmp->next;
+
+		g_ptr_array_remove(nci->conns, conn);
+		nc_conn_free(conn);
+		n_gc++;
+	}
+
+	g_list_free(dead);
+
+	if (debugging)
+		fprintf(stderr, "net: gc'd %u connections\n", n_gc);
 }
 
 static void nc_conns_open(struct net_child_info *nci)
 {
+	if (debugging)
+		fprintf(stderr, "net: open connections (have %u, want %u more)\n", 
+			nci->conns->len,
+			NC_MAX_CONN - nci->conns->len);
+
 	while ((g_hash_table_size(nci->peers->map_addr) > 0) &&
 	       (nci->conns->len < NC_MAX_CONN)) {
 
 		/* delete peer from front of address list.  it will be
 		 * re-added before writing peer file, if successful
 		 */
-		struct bp_address *addr = peerman_pop(nci->peers);
+		struct peer *peer = peerman_pop(nci->peers);
 
-		struct nc_conn *conn = nc_conn_new(addr);
+		struct nc_conn *conn = nc_conn_new(peer);
 		conn->nci = nci;
-		free(addr);
+		peer_free(peer);
+		free(peer);
+
+		if (debugging)
+			fprintf(stderr, "net: connecting to %s\n",
+				conn->addr_str);
 
 		/* are we already connected to this IP? */
-		if (nc_conn_ip_active(nci, conn->addr.ip))
+		if (nc_conn_ip_active(nci, conn->peer.addr.ip)) {
+			fprintf(stderr, "net: already connected to %s\n",
+				conn->addr_str);
 			goto err_loop;
+		}
 
 		/* initiate non-blocking connect(2) */
-		if (!nc_conn_start(conn))
+		if (!nc_conn_start(conn)) {
+			fprintf(stderr, "net: failed to start connection to %s\n",
+				conn->addr_str);
 			goto err_loop;
+		}
 
 		/* add to our list of monitored event sources */
 		conn->ev = event_new(nci->eb, conn->fd, EV_WRITE,
 				     nc_conn_evt_connected, conn);
-		if (!conn->ev)
+		if (!conn->ev) {
+			fprintf(stderr, "net: event_new failed on %s\n",
+				conn->addr_str);
 			goto err_loop;
+		}
 
-		struct timeval timeout = { 60, };
-		if (event_add(conn->ev, &timeout) != 0)
+		struct timeval timeout = { 30, };
+		if (event_add(conn->ev, &timeout) != 0) {
+			fprintf(stderr, "net: event_add failed on %s\n",
+				conn->addr_str);
 			goto err_loop;
+		}
 
 		/* add to our list of active connections */
 		g_ptr_array_add(nci->conns, conn);
@@ -748,8 +927,14 @@ static void nc_conns_open(struct net_child_info *nci)
 		continue;
 
 err_loop:
-		nc_conn_free(conn);
+		nc_conn_kill(conn);
 	}
+}
+
+static void nc_conns_process(struct net_child_info *nci)
+{
+	nc_conns_gc(nci);
+	nc_conns_open(nci);
 }
 
 static void nc_pipe_evt(int fd, short events, void *priv)
@@ -764,6 +949,7 @@ static void nc_pipe_evt(int fd, short events, void *priv)
 		break;
 
 	case NC_STOP:
+		network_child_running = false;
 		sendcmd(nci->write_fd, NC_OK);
 		event_base_loopbreak(nci->eb);
 		break;
@@ -775,6 +961,8 @@ static void nc_pipe_evt(int fd, short events, void *priv)
 
 static void network_child(int read_fd, int write_fd)
 {
+	network_child_running = true;
+
 	/*
 	 * read network peers
 	 */
@@ -782,30 +970,56 @@ static void network_child(int read_fd, int write_fd)
 
 	peers = peerman_read();
 	if (!peers) {
-		peers = peerman_seed();
-		peerman_write(peers);
+		fprintf(stderr, "net: initializing empty peer list\n");
+
+		peers = peerman_seed(setting("no_dns") == NULL ? true : false);
+		if (!peerman_write(peers)) {
+			fprintf(stderr, "net: failed to write peer list\n");
+			exit(1);
+		}
 	}
+
+	char *addnode = setting("addnode");
+	if (addnode)
+		peerman_addstr(peers, addnode);
+
+	if (debugging)
+		fprintf(stderr, "net: have %u/%u peers\n",
+			g_hash_table_size(peers->map_addr),
+			g_list_length(peers->addrlist));
 
 	/*
 	 * read block database
 	 */
 	struct blkdb db;
-	if (!blkdb_init(&db, chain->netmagic, &chain_genesis))
+	if (!blkdb_init(&db, chain->netmagic, &chain_genesis)) {
+		fprintf(stderr, "net: blkdb init failed\n");
 		exit(1);
+	}
 
 	char *blkdb_fn = setting("blkdb");
-	if (!blkdb_fn)
+	if (!blkdb_fn) {
+		fprintf(stderr, "net: blkdb filename not specified\n");
 		exit(1);
+	}
 	if ((access(blkdb_fn, F_OK) == 0) &&
-	    (!blkdb_read(&db, blkdb_fn)))
+	    (!blkdb_read(&db, blkdb_fn))) {
+		fprintf(stderr, "net: failed to read blkdb %s\n", blkdb_fn);
 		exit(1);
+	}
 
 	/*
 	 * prep block database for new records
 	 */
 	db.fd = open(blkdb_fn, O_WRONLY | O_APPEND | O_CREAT, 0666);
-	if (db.fd < 0)
+	if (db.fd < 0) {
+		fprintf(stderr, "net: open %s failed: %s\n",
+			blkdb_fn, strerror(errno));
 		exit(1);
+	}
+
+	if (debugging)
+		fprintf(stderr, "net: blkdb opened\n");
 	
 	/*
 	 * set up libevent dispatch
@@ -820,10 +1034,11 @@ static void network_child(int read_fd, int write_fd)
 			     nc_pipe_evt, &nci);
 	event_add(pipe_evt, NULL);
 
-	nc_conns_open(&nci);		/* start opening P2P connections */
-
 	/* main loop */
-	event_base_dispatch(nci.eb);
+	do {
+		nc_conns_process(&nci);
+		event_base_dispatch(nci.eb);
+	} while (network_child_running);
 
 	/* cleanup: just the minimum for file I/O correctness */
 	peerman_write(peers);
@@ -857,7 +1072,7 @@ static bool neteng_cmd_exec(pid_t child, int read_fd, int write_fd,
 {
 	sendcmd(write_fd, nc);
 
-	enum netcmds ncr = readcmd(read_fd, 60);
+	enum netcmds ncr = readcmd(read_fd, debugging ? 1000 : 60);
 	if (ncr != NC_OK)
 		return false;
 
@@ -874,7 +1089,11 @@ bool neteng_start(struct net_engine *neteng)
 	if (pipe(neteng->tx_pipefd) < 0)
 		goto err_out_rxfd;
 
+	#ifdef WIN32 
+	neteng->child = createthread();
+	#else 
 	neteng->child = fork();
+	#endif
 	if (neteng->child == -1)
 		goto err_out_txfd;
 
@@ -889,8 +1108,14 @@ bool neteng_start(struct net_engine *neteng)
 	int par_read = neteng->par_read = neteng->rx_pipefd[0];
 	int par_write = neteng->par_write = neteng->tx_pipefd[1];
 
+	if (debugging)
+		fprintf(stderr, "net: parent exec NC_START\n");
+
 	if (!neteng_cmd_exec(neteng->child, par_read, par_write, NC_START))
 		goto err_out_child;
+
+	if (debugging)
+		fprintf(stderr, "net: parent after NC_START\n");
 
 	neteng->running = true;
 	return true;
@@ -914,6 +1139,9 @@ void neteng_stop(struct net_engine *neteng)
 {
 	if (!neteng->running)
 		return;
+
+	if (debugging)
+		fprintf(stderr, "net: stopping engine\n");
 
 	if (!neteng_cmd_exec(neteng->child, neteng->par_read,
 			     neteng->par_write, NC_STOP))
@@ -962,6 +1190,18 @@ static struct net_engine *neteng_new_start(void)
 void network_sync(void)
 {
 	struct net_engine *neteng = neteng_new_start();
+
+	char *sleep_str = setting("sleep");
+	int nsec = atoi(sleep_str ? sleep_str : "");
+	if (nsec < 1)
+		nsec = 10 * 60;
+
+	if (debugging)
+		fprintf(stderr, "net: engine started. sleeping %d %s\n",
+			(nsec > 60) ? nsec/60 : nsec,
+			(nsec > 60) ? "minutes" : "seconds");
+	
+	sleep(nsec);
 
 	neteng_free(neteng);
 }

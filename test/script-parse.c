@@ -16,6 +16,7 @@
 #include <ccoin/core.h>
 #include <ccoin/mbr.h>
 #include <ccoin/message.h>
+#include <ccoin/compat.h>
 #include "libtest.h"
 
 static void test_txout(const struct bp_txout *txout)
@@ -72,7 +73,7 @@ static void test_txout(const struct bp_txout *txout)
 static void runtest(const char *ser_fn_base)
 {
 	char *ser_fn = test_filename(ser_fn_base);
-	int fd = open(ser_fn, O_RDONLY);
+	int fd = file_seq_open(ser_fn);
 	if (fd < 0) {
 		perror(ser_fn);
 		exit(1);

@@ -73,13 +73,9 @@ bool bu_read_file(const char *filename, void **data_, size_t *data_len_,
 	*data_ = NULL;
 	*data_len_ = 0;
 
-	int fd = open(filename, O_RDONLY);
+	int fd = file_seq_open(filename);
 	if (fd < 0)
 		return false;
-
-#if _XOPEN_SOURCE >= 600 || _POSIX_C_SOURCE >= 200112L
-	posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
 
 	if (fstat(fd, &st) < 0)
 		goto err_out_fd;
@@ -113,13 +109,13 @@ err_out_fd:
 
 bool bu_write_file(const char *filename, const void *data, size_t data_len)
 {
-	char *tmpfn = calloc(1, strlen(filename) + 16);
+	char tmpfn[strlen(filename) + 16];
 	strcpy(tmpfn, filename);
 	strcat(tmpfn, ".XXXXXX");
 
 	int fd = mkstemp(tmpfn);
 	if (fd < 0)
-		goto err_out_tmpfn;
+		return false;
 
 	ssize_t wrc = write(fd, data, data_len);
 	if (wrc != data_len)
@@ -131,15 +127,12 @@ bool bu_write_file(const char *filename, const void *data, size_t data_len)
 	if (rename(tmpfn, filename) < 0)
 		goto err_out_fd;
 
-	free(tmpfn);
 	return true;
 
 err_out_fd:
 	if (fd >= 0)
 		close(fd);
 	unlink(tmpfn);
-err_out_tmpfn:
-	free(tmpfn);
 	return false;
 }
 
@@ -157,5 +150,29 @@ unsigned long djb2_hash(unsigned long hash, const void *_buf, size_t buflen)
 	}
 
 	return hash;
+}
+
+void g_list_shuffle(GList *l)
+{
+	unsigned int len = g_list_length(l);
+	unsigned int idx = 0;
+
+	GList *tmp = l;
+	while (tmp) {
+		unsigned int ridx = g_random_int_range(0, len - 1);
+
+		if (ridx != idx) {
+			GList *swap = g_list_nth(l, ridx);
+
+			void *tmp_data = tmp->data;
+			void *swap_data = swap->data;
+
+			tmp->data = swap_data;
+			swap->data = tmp_data;
+		}
+
+		tmp = tmp->next;
+		idx++;
+	}
 }
 
