@@ -15,7 +15,7 @@ GString *bp_pubkey_get_address(struct bp_key *key, unsigned char addrtype)
 	void *pubkey = NULL;
 	size_t pk_len = 0;
 
-	bp_pubkey_get(key, &pubkey, &pk_len);
+	bp_pubkey_get_uncompressed(key, &pubkey, &pk_len);
 
 	unsigned char md160[RIPEMD160_DIGEST_LENGTH];
 

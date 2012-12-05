@@ -170,6 +170,14 @@ bool bp_pubkey_get(struct bp_key *key, void **pubkey, size_t *pk_len)
 	return true;
 }
 
+
+bool bp_pubkey_get_uncompressed(struct bp_key *key, void **pubkey, size_t *pk_len){
+	bool ret;
+	EC_KEY_set_conv_form(key->k, POINT_CONVERSION_UNCOMPRESSED);
+	ret = bp_pubkey_get(key, pubkey, pk_len);
+	EC_KEY_set_conv_form(key->k, POINT_CONVERSION_COMPRESSED);
+}
+
 bool bp_key_secret_get(void *p, size_t len, const struct bp_key *key)
 {
 	if (!p || len < 32 || !key)
